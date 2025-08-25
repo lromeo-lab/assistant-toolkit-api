@@ -1,0 +1,23 @@
+# Environment variables - DO NOT COMMIT
+.env
+
+# Python virtual environment
+agentforge-venv/
+venv/
+*.venv
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE/Editor specific files
+.vscode/
+.idea/
+
+# Additional scripts and notebooks
+assistant_script.py
+assistant_script.ipynb
+retriever_test.ipynb
+test.py

@@ -3,6 +3,7 @@
 
 # Python virtual environment
 agentforge-venv/
+venv-notebook/
 venv/
 *.venv
 

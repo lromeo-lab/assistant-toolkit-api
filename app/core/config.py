@@ -14,7 +14,9 @@ class DataBaseSettings(BaseSettings):
     redis_url: str
     db_name: str
     file_collection_name: str
-    chat_history_collection_name: str
+    agent_collection_name: str
+    thread_collection_name: str
+    chat_collection_name: str
     atlas_vector_index_name: str
     atlas_search_index_name: str
     memory_token_limit: int
@@ -49,7 +51,7 @@ class AssistantSettings(BaseSettings):
 
 class Settings(BaseSettings):
     """Main application settings, composed of nested configuration models."""
-    project_name: str = "Assistant Toolkit API"
+    project_name: str = "Agent Toolkit API"
     api_v1_str: str = "/api/v1"
     memory_management_root_endpoint: str
 
@@ -59,8 +61,7 @@ class Settings(BaseSettings):
 
     # This is the important part: inside the class
     model_config = SettingsConfigDict(
-        env_nested_delimiter='__',   # enables DATABASE__MONGO_URI, LLM__MODEL_NAME, etc.
-        #case_sensitive=True,
+        env_nested_delimiter='__',
         env_file=".env",
         env_file_encoding="utf-8",
     )

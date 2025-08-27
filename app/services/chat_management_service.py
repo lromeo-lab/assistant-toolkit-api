@@ -1,6 +1,4 @@
-import os
-from typing import Optional, List, Dict, Any
-import uuid
+from typing import Optional
 import logging
 import pymongo
 import certifi
@@ -16,7 +14,7 @@ from llama_index.storage.chat_store.redis import RedisChatStore
 
 from app.core.config import Settings
 
-class MemoryPipeline:
+class ChatManagementService:
     """
     A service class for processing chats and uploading them to a specified MongoDB Atlas collection,
     ensuring the necessary hybrid search indexes are created automatically.
@@ -45,47 +43,47 @@ class MemoryPipeline:
         if not settings.database.redis_url:
             raise ValueError("REDIS_URL not found in .env file. Please add it.")
         self.redis_chat_store = RedisChatStore(redis_url=settings.database.redis_url, **{"ssl_ca_certs": certifi.where()})
+
+        self.db_name = self.settings.database.db_name
+        self.chat_collection_name = self.settings.database.chat_collection_name
+        self.vector_index_name = self.settings.database.atlas_vector_index_name
+        self.search_index_name = self.settings.database.atlas_search_index_name
         
         logging.info("ChatMemoryService initialized successfully.")
 
-    def _ensure_atlas_indexes(self, db_name: str, collection_name: str, vector_index_name: str, search_index_name: str):
+    def _ensure_chat_indexes(self):
         """
-        Creates the necessary Vector Search and Atlas Search indexes if they don't exist.
+        Creates the necessary Vector Search and Full Text Search indexes if they don't exist.
         This should be called AFTER documents have been inserted into the collection.
         """
-        collection = self.mongo_client[db_name][collection_name]
+        collection = self.mongo_client[self.db_name][self.chat_collection_name]
         
         vector_search_model = SearchIndexModel(
             definition={
                 "fields": [
-                    {
-                        "type": "vector",
-                        "path": "embedding",
-                        "numDimensions": 1536,
-                        "similarity": "cosine",
-                    },
+                    {"type": "vector","path": "embedding","numDimensions": 1536,"similarity": "cosine"},
                     {"type": "filter", "path": "metadata.thread_id"},
                     {"type": "filter", "path": "metadata.turn_id"}
                 ]
             },
-            name=vector_index_name,
+            name=self.vector_index_name,
             type="vectorSearch",
         )
         
         full_text_model = SearchIndexModel(
             definition={"mappings": {"dynamic": True, "fields": {"text": {"type": "string"}}}},
-            name=search_index_name,
+            name=self.search_index_name,
             type="search",
         )
         
         # We reached the maximum number of indexes for free tier (3), 2 for docs and 1 for chat history (Text Search)
         # - IN PROD: we can activate this vector index to perform hybrid search over chats
-        index_names = [search_index_name] # add vector_index_name in PROD
+        index_names = [self.search_index_name] # add self.vector_index_name in PROD
         models = [full_text_model] # add vector_search_model in PROD
 
         for index_name,model in zip(index_names,models):
             try:
-                logging.info(f"Ensuring Atlas index '{index_name}' exists...")
+                logging.info(f"Ensuring chat index '{index_name}' exists...")
                 collection.create_search_index(model=model)
             except pymongo.errors.OperationFailure as e:
                 if "already exists" in str(e).lower():
@@ -93,11 +91,11 @@ class MemoryPipeline:
                 else:
                     raise e
 
-    def _load_and_prepare_chat(self, user_query: str, assistant_response: str, thread_id: str, turn_id: Optional[int]) -> Document:
+    def _load_and_prepare_chat(self, user_query: str, agent_response: str, thread_id: str, turn_id: int) -> Document:
         """
         Loads a chat interaction and enriches it with the provided metadata.
         """
-        turn_text = f"User: {user_query}\nAssistant: {assistant_response}"
+        turn_text = f"User: {user_query}\nAgent: {agent_response}"
         
         doc = Document(
             text=turn_text,
@@ -108,29 +106,27 @@ class MemoryPipeline:
         )
         return doc
 
-    def run(self, db_name: str, collection_name: str, user_query: str, assistant_response: str, thread_id: str, turn_id: Optional[int] = None):
+    def ingest_chat(self, user_query: str, agent_response: str, thread_id: str, turn_id: int):
         """
         Runs the memory pipeline on a specific MongoDB database and collection.
         """
 
-        logging.info(f"--- Starting batch ingestion for MongoDB collection '{db_name}.{collection_name}' ---")
+        logging.info(f"--- Starting batch ingestion for MongoDB collection '{self.db_name}.{self.chat_collection_name}' ---")
         
         try:
-            vector_index_name = "vector_index"
-            search_index_name = "search_index"
 
             vector_store = MongoDBAtlasVectorSearch(
                 mongodb_client=self.mongo_client,
-                db_name=db_name,
-                collection_name=collection_name,
-                vector_index_name=vector_index_name,
-                search_index_name=search_index_name
+                db_name=self.db_name,
+                collection_name=self.chat_collection_name,
+                vector_index_name=self.vector_index_name,
+                fulltext_index_name=self.search_index_name
             )
             storage_context = StorageContext.from_defaults(vector_store=vector_store)
 
             doc = self._load_and_prepare_chat(
                 user_query,
-                assistant_response,
+                agent_response,
                 thread_id,
                 turn_id
             )
@@ -150,32 +146,9 @@ class MemoryPipeline:
             )
             
             # Now that the collection exists and has data, ensure the search indexes are created on it.
-            self._ensure_atlas_indexes(db_name, collection_name, vector_index_name, search_index_name)
+            self._ensure_chat_indexes()
             
-            logging.info(f"--- Successfully processed and indexed all nodes for collection '{db_name}.{collection_name}' ---")
+            logging.info(f"--- Successfully processed and indexed all nodes for collection '{self.db_name}.{self.chat_collection_name}' ---")
         
         except Exception:
             logging.exception("An unexpected error occurred during the memory run.")
-    
-    def delete_chat_history(self, db_name: str, collection_name: str, thread_id: str):
-        """
-        Deletes an entire conversation history from both long-term (MongoDB)
-        and short-term (Redis) memory.
-        """
-        logging.warning(f"--- DELETING entire history for thread '{thread_id}' ---")
-        
-        # 1. Delete from Long-Term Memory (MongoDB)
-        try:
-            collection = self.mongo_client[db_name][collection_name]
-            result = collection.delete_many({"metadata.thread_id": thread_id})
-            logging.info(f"Deleted {result.deleted_count} documents from MongoDB for thread '{thread_id}'.")
-        except Exception:
-            logging.exception(f"Failed to delete history from MongoDB for thread '{thread_id}'.")
-
-        # 2. Delete from Short-Term Memory (Redis)
-        try:
-            # The thread_id is how we identify the conversation in Redis
-            self.redis_chat_store.delete_messages(thread_id)
-            logging.info(f"Deleted history from Redis for thread '{thread_id}'.")
-        except Exception:
-            logging.exception(f"Failed to delete history from Redis for thread '{thread_id}'.")

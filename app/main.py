@@ -1,7 +1,13 @@
 import logging
 import sys
-from fastapi import FastAPI
-from app.api.v1.endpoints import agent_management, file_management, thread_management, chat_management, assistant 
+from fastapi import FastAPI, Request
+from app.api.v1.endpoints import (
+    agent_management,
+    file_management,
+    thread_management,
+    chat_management,
+    assistant,
+    worker_management)
 from app.core.config import get_settings
 
 # --- CORRECTED & ROBUST LOGGING SETUP ---
@@ -44,6 +50,7 @@ app.include_router(agent_management.router, prefix=settings.api_v1_str, tags=["A
 app.include_router(thread_management.router, prefix=settings.api_v1_str, tags=["Thread Management"])
 app.include_router(file_management.router, prefix=settings.api_v1_str, tags=["File Management"])
 app.include_router(chat_management.router, prefix=settings.api_v1_str, tags=["Chat Management"])
+app.include_router(worker_management.router, prefix=settings.api_v1_str, tags=["Worker Management"])
 app.include_router(assistant.router, prefix=settings.api_v1_str, tags=["Agent Engine"])
 
 # --- Root Endpoint ---

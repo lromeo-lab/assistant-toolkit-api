@@ -1,147 +1,143 @@
 import logging
-from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks, Body, Query
+from typing import Optional, List, Tuple
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks, Body, Query
 import tempfile
 import os
 import shutil
-from pydantic import BaseModel, Field
+import httpx
 
-from app.core.config import Settings, get_settings
-from app.services.file_management_service import FileManagementService
+from app.core.clients import get_worker_client
+
 from app.services.agent_management_service import AgentManagementService
 from app.services.thread_management_service import ThreadManagementService
-from .agent_management import get_agent_management_service
-from .thread_management import get_thread_management_service
+from app.services.file_management_service import FileManagementService
+from app.services.validation_management_service import ValidationManagementService
+
+# --- Import schemas ---
+from app.api.v1.schemas import (
+    DeleteFileRequest,
+    FileIngestionRequest,
+    FileListResponse,
+    FileIngestionResponse,
+    MessageResponse
+)
+
+# --- Import injection dependencies ---
+from app.api.v1.dependencies import (
+    get_agent_management_service,
+    get_thread_management_service,
+    get_file_management_service,
+    get_validation_management_service
+)
 
 # Create an API router
 router = APIRouter()
 
-# --- Dependency Injection ---
-_file_management_service = None
-def get_file_management_service(settings: Settings = Depends(get_settings)) -> FileManagementService:
-    global _file_management_service
-    if _file_management_service is None:
-        _file_management_service = FileManagementService(settings)
-    return _file_management_service
-
-# --- Background Task Helper ---
-def run_ingestion_and_cleanup(service: FileManagementService, temp_dir: str, **kwargs):
-    """Wrapper to run ingestion and then clean up the temp directory."""
-    try:
-        service.ingest_files(**kwargs)
-    finally:
-        logging.info(f"Cleaning up temporary directory: {temp_dir}")
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-# --- Pydantic Models (Standardized) ---
-class FileResponse(BaseModel):
-    file_id: str
-    file_name: str
-    user_ids: Optional[List[str]] = None
-
-class FileListResponse(BaseModel):
-    files: List[FileResponse]
-
-class DeleteFileRequest(BaseModel):
-    owner_user_id: str = Field(..., description="The ID of the user who owns the agent/thread, for permission validation.")
-
-class MessageResponse(BaseModel):
-    """A standard response model for simple messages."""
-    message: str
-
-class IngestionResponse(BaseModel):
-    message: str
-    agent_id: str
-    filenames: List[str]
-    applied_user_ids: List[str]
-    excluded_user_ids: List[str]
-
-# --- API Endpoints (Standardized) ---
-
-@router.post("/files", status_code=202, response_model=IngestionResponse)
-async def upload_files(
-    background_tasks: BackgroundTasks,
-    owner_user_id: str = Form(..., description="The ID of the user uploading the files, for permission validation."),
-    files: List[UploadFile] = File(..., description="A list of files to be ingested."),
-    agent_id: Optional[str] = Form(None, description="The unique ID of the agent to associate with these files."),
-    thread_id: Optional[str] = Form(None, description="The unique ID of the thread to associate with these files."),
-    user_ids: Optional[List[str]] = Form(None, description="A list of user IDs who have access to these files."),
-    service: FileManagementService = Depends(get_file_management_service),
-    agent_service: AgentManagementService = Depends(get_agent_management_service),
-    thread_service: ThreadManagementService = Depends(get_thread_management_service)
+# --- Private Helper Functions for the Upload Endpoint ---
+async def call_worker_endpoint(
+    url: str,
+    payload: dict
 ):
-    """
-    Accepts files and ingests them, associating them with either an agent or a thread.
-    """
-    if user_ids:
-        # Check if the list contains a single item that is a comma-separated string
-        if len(user_ids) == 1 and ',' in user_ids[0]:
-            user_ids = [uid.strip() for uid in user_ids[0].split(',')]
-        else:
-            user_ids = user_ids
+    """Makes an async HTTP request to a worker endpoint."""
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(url, json=payload, timeout=60.0)
+            response.raise_for_status()
+            logging.info(f"Successfully triggered worker with payload: {payload}")
+        except httpx.RequestError as e:
+            logging.error(f"Failed to call worker endpoint at {url}: {e}")
 
-    # Validate provided params
-    if not agent_id and not thread_id:
-        raise HTTPException(status_code=400, detail="You must provide either an 'agent_id' or a 'thread_id'.")
-    if agent_id and thread_id:
-        raise HTTPException(status_code=400, detail="Please provide either an 'agent_id' or a 'thread_id', not both.")
-    
-    final_file_user_ids = []
-    excluded_user_ids = []
-    
-    # --- Conditional Logic for Permissions ---
-    if agent_id:
-        # AGENT PATH: Apply hierarchical permissions
-        if not agent_service.is_owner_of_agent(agent_id=agent_id, owner_user_id=owner_user_id):
-            raise HTTPException(status_code=403, detail="Permission denied: You do not own this agent.")
-        
-        agent = agent_service.get_agent_by_id(agent_id)
-        agent_user_ids = agent.get("user_ids")
+def _parse_user_ids(
+    user_ids_form: Optional[List[str]]
+) -> Optional[List[str]]:
+    """Parses user_ids from a form, handling the comma-separated string case."""
+    if not user_ids_form:
+        return None
+    if len(user_ids_form) == 1 and ',' in user_ids_form[0]:
+        return [uid.strip() for uid in user_ids_form[0].split(',')]
+    return user_ids_form
 
-        permission_result = service.calculate_file_permissions(
-            agent_user_ids=agent_user_ids,
-            file_user_ids=user_ids,
-            owner_user_id=owner_user_id
-        )
-        final_file_user_ids = permission_result["applied_user_ids"]
-        excluded_user_ids = permission_result["excluded_user_ids"]
-
-    elif thread_id:
-        # THREAD PATH: Lock permissions to the thread owner
-        if not thread_service.is_owner_of_thread(thread_id=thread_id, owner_user_id=owner_user_id):
-            raise HTTPException(status_code=403, detail="Permission denied: You do not own this thread.")
-        
-        final_file_user_ids = [owner_user_id]
-        if user_ids:
-            logging.warning(f"User IDs provided for thread '{thread_id}' were ignored to enforce thread privacy.")
-            excluded_user_ids = list(set(user_ids) - {owner_user_id})
-
-    # Temp directory
+def _save_files_to_temp_dir(
+    files: List[UploadFile]
+) -> Tuple[str, List[str]]:
+    """Saves uploaded files to a temporary directory and returns the paths."""
     temp_dir = tempfile.mkdtemp()
     file_paths = []
     for file in files:
         file_path = os.path.join(temp_dir, file.filename)
         try:
-            with open(file_path, "wb") as f: shutil.copyfileobj(file.file, f)
+            with open(file_path, "wb") as f:
+                shutil.copyfileobj(file.file, f)
             file_paths.append(file_path)
         finally:
             file.file.close()
+    return temp_dir, file_paths
 
-    # Run the process
+# --- Main User-Facing Endpoint ---
+
+@router.post("/schedule-ingest-files", status_code=202, response_model=FileIngestionResponse)
+async def upload_files(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+    request: FileIngestionRequest = Body(...),
+    # --- Services and their dependencies ---
+    worker_url = Depends(get_worker_client),
+    agent_service: AgentManagementService = Depends(get_agent_management_service),
+    validation_service: ValidationManagementService = Depends(get_validation_management_service)
+):
+    """
+    Accepts files and schedules them for ingestion after validating permissions.
+    """
+    # 1. Parse and clean input data
+    parsed_user_ids = _parse_user_ids(request.user_ids)
+
+    # 2. Handle all permission logic
+    validation_service.at_least_thread_or_agent(agent_id=request.agent_id, thread_id=request.thread_id)
+    validation_service.not_both_thread_and_agent(agent_id=request.agent_id,thread_id=request.thread_id)
+    
+    if request.agent_id:
+        validation_service.is_valid_agent(agent_id=request.agent_id)
+        validation_service.is_owner_of_agent(agent_id=request.agent_id,owner_user_id=request.owner_user_id)
+        
+        agent = agent_service.get_agent_by_id(agent_id=request.agent_id)
+        agent_user_ids = agent.get("user_ids", [])
+        final_file_user_ids, excluded_user_ids=validation_service.adjust_file_on_agent_permissions(
+            agent_user_ids=agent_user_ids,
+            file_user_ids=parsed_user_ids
+        )
+
+    if request.thread_id:
+        validation_service.is_valid_thread(thread_id=request.thread_id)
+        validation_service.is_owner_of_thread(thread_id=request.thread_id,owner_user_id=request.owner_user_id)
+        final_file_user_ids, excluded_user_ids=validation_service.adjust_file_on_thread_permissions(
+            thread_owner_user_id=request.owner_user_id,
+            file_user_ids=parsed_user_ids
+        )
+
+    # 3. Handle file I/O
+    temp_dir, file_paths = _save_files_to_temp_dir(files)
+
+    # 4. Schedule the background task
+    payload = {
+        "file_paths": file_paths,
+        "temp_dir": temp_dir,
+        "owner_user_id": request.owner_user_id,
+        "agent_id": request.agent_id,
+        "thread_id": request.thread_id,
+        "user_ids": final_file_user_ids
+    }
+
+    # 5. Run the endpoint in a backgroung task
     background_tasks.add_task(
-        run_ingestion_and_cleanup,
-        service=service,
-        temp_dir=temp_dir,
-        file_paths=file_paths,
-        owner_user_id=owner_user_id,
-        agent_id=agent_id,
-        thread_id=thread_id,
-        user_ids=final_file_user_ids
+        call_worker_endpoint,
+        url=f"{worker_url}/ingest-files",
+        payload=payload
     )
 
-    return IngestionResponse(
+    # 6. Return the response
+    return FileIngestionResponse(
         message="Files received. Ingestion has started in the background.",
-        agent_id=agent_id,
+        agent_id=request.agent_id,
         filenames=[f.filename for f in files],
         applied_user_ids=final_file_user_ids,
         excluded_user_ids=excluded_user_ids
@@ -150,32 +146,20 @@ async def upload_files(
 @router.get("/agents/{agent_id}/files", response_model=FileListResponse)
 def list_files_for_agent(
     agent_id: str,
-    user_id: str = Query(..., description="The ID of the user making the request, for permission checking."),
+    user_id: str = Query(...),
     service: FileManagementService = Depends(get_file_management_service),
-    agent_service: AgentManagementService = Depends(get_agent_management_service)
+    validation_service: ValidationManagementService = Depends(get_validation_management_service)
 ):
     """Lists all unique files for an agent that the user is permitted to see."""
-    # 1. First, check if the user has any access to the agent at all.
-    if not agent_service.has_access_to_agent(agent_id=agent_id, user_id=user_id):
-        raise HTTPException(status_code=403, detail="Permission denied or agent not found.")
-    
-    # 2. Get the agent's details to find its owner.
-    agent = agent_service.get_agent_by_id(agent_id=agent_id)
-    if not agent:
-         raise HTTPException(status_code=404, detail="Agent not found.")
-
-    # 3. Call the service with the necessary info to get the correctly filtered file list.
-    files_data = service.list_files_for_agent(
-        agent_id=agent_id, 
-        user_id=user_id, 
-        agent_owner_id=agent["owner_user_id"]
-    )
+    validation_service.is_valid_agent(agent_id=agent_id)
+    validation_service.has_access_to_agent(agent_id=agent_id,user_id=user_id)
+    files_data = service.list_files_for_agent(agent_id=agent_id, user_id=user_id)
     return FileListResponse(files=files_data)
 
-@router.get("/users/{user_id}/files", response_model=FileListResponse)
+@router.get("/users/{user_id}/files", response_model=FileListResponse, response_model_exclude={"files": {"__all__": {"user_ids"}}})
 def list_files_for_user(
     user_id: str,
-    by_owner: bool = Query(True, description="If true, lists files owned by the user. If false, lists files the user has access to."),
+    by_owner: bool = Query(True),
     service: FileManagementService = Depends(get_file_management_service)
 ):
     """Lists files for a user, either by ownership or by authorized access."""
@@ -185,17 +169,16 @@ def list_files_for_user(
         files_data = service.list_files_for_user(user_id=user_id)
     return FileListResponse(files=files_data)
 
-@router.get("/threads/{thread_id}/files", response_model=FileListResponse)
+@router.get("/threads/{thread_id}/files", response_model=FileListResponse, response_model_exclude={"files": {"__all__": {"user_ids"}}})
 def list_files_for_thread(
     thread_id: str,
-    user_id: str = Query(..., description="The ID of the user making the request, for permission checking."),
+    user_id: str = Query(...),
     service: FileManagementService = Depends(get_file_management_service),
-    thread_service: ThreadManagementService = Depends(get_thread_management_service)
+    validation_service: ValidationManagementService = Depends(get_validation_management_service)
 ):
     """Lists all unique files associated with a specific thread, if the user owns it."""
-    if not thread_service.is_owner_of_thread(thread_id=thread_id, owner_user_id=user_id):
-        raise HTTPException(status_code=403, detail="Permission denied or thread not found.")
-        
+    validation_service.is_valid_thread(thread_id=thread_id)
+    validation_service.is_owner_of_thread(thread_id=thread_id,owner_user_id=user_id)
     files_data = service.list_files_for_thread(thread_id=thread_id)
     return FileListResponse(files=files_data)
 
@@ -203,15 +186,11 @@ def list_files_for_thread(
 def delete_file(
     file_id: str,
     request: DeleteFileRequest = Body(...),
-    service: FileManagementService = Depends(get_file_management_service)
+    service: FileManagementService = Depends(get_file_management_service),
+    validation_service: ValidationManagementService = Depends(get_validation_management_service)
 ):
     """Deletes all nodes for a specific file_id after validating ownership."""
-    if not service.is_owner_of_file(file_id=file_id, user_id=request.owner_user_id):
-        raise HTTPException(status_code=403, detail="Permission denied: You do not have permission to delete this file.")
-    
+    validation_service.is_valid_file(file_id=file_id)
+    validation_service.is_owner_of_file(file_id=file_id,owner_user_id=request.owner_user_id)
     deleted_count = service.delete_file_by_id(file_id=file_id)
-    
-    if deleted_count == 0:
-        raise HTTPException(status_code=404, detail="File not found.")
-
     return MessageResponse(message=f"File '{file_id}' and its {deleted_count} associated nodes have been deleted.")

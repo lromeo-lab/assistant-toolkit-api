@@ -3,16 +3,13 @@ from typing import Optional, List, Dict, Any
 import uuid
 import logging
 import pymongo
-import certifi
-from pymongo.operations import SearchIndexModel
 from datetime import datetime, timezone
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # --- LlamaIndex and MongoDB Imports ---
 from llama_index.core import SimpleDirectoryReader, Document, VectorStoreIndex, StorageContext
 from llama_index.core.node_parser import TokenTextSplitter
-#from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.embeddings import BaseEmbedding
-from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.mongodb import MongoDBAtlasVectorSearch
 
 from app.core.config import Settings
@@ -22,137 +19,101 @@ class FileManagementService:
     A service class for processing documents and uploading them to a specified MongoDB Atlas collection,
     ensuring the necessary hybrid search indexes are created automatically.
     """
-    def __init__(self, settings: Settings):
-        """
-        Initializes the pipeline with necessary configurations and clients.
-        """
-        self.settings = settings
+    def __init__(
+            self,
+            settings: Settings,
+            mongo_client: pymongo.MongoClient,
+            embed_model: BaseEmbedding,
+            text_splitter: TokenTextSplitter
+        ):
         logging.info("Initializing IngestionPipeline service for MongoDB Atlas...")
-        self.embed_model: BaseEmbedding = OpenAIEmbedding(
-            model=self.settings.llm.embedding_model_name, 
-            api_key=self.settings.llm.openai_api_key
-        )
-        if not settings.database.mongo_uri:
-            raise ValueError("MONGO_URI not found in .env file. Please add it.")
-        self.mongo_client = pymongo.MongoClient(settings.database.mongo_uri, tlsCAFile=certifi.where())
-        
-        self.text_splitter = TokenTextSplitter(
-            chunk_size=self.settings.llm.chunk_size,
-            chunk_overlap=self.settings.llm.chunk_overlap
-        )
-
+        self.embed_model = embed_model
+        self.mongo_client = mongo_client
+        self.text_splitter = text_splitter
+        self.batch_size = settings.llm.ingestion_batch_size
         self.db_name = settings.database.db_name
-        self.db = self.mongo_client[self.db_name]
-
-        self.file_collection_name = self.settings.database.file_collection_name
-        self.file_collection = self.db[self.file_collection_name]
-        
-        self.vector_index_name = self.settings.database.atlas_vector_index_name
-        self.search_index_name = self.settings.database.atlas_search_index_name
+        self.file_collection_name = settings.database.file_collection_name
+        self.file_collection = self.mongo_client[self.db_name][self.file_collection_name]
         logging.info("IngestionPipeline service initialized successfully.")
 
     def _generate_file_id(self) -> str:
-        """Generates a unique, prefixed ID for a new file."""
         return f"file_{uuid.uuid4().hex}"
-    
-    def _ensure_atlas_indexes(self):
-        """
-        Creates the necessary Vector Search and Full Text Search indexes if they don't exist.
-        This should be called AFTER documents have been inserted into the collection.
-        """
-        
-        vector_search_model = SearchIndexModel(
-            definition={
-                "fields": [
-                    {"type": "vector","path": "embedding","numDimensions": 1536,"similarity": "cosine"},
-                    {"type": "filter", "path": "metadata.agent_id"},
-                    {"type": "filter", "path": "metadata.thread_id"},
-                    {"type": "filter", "path": "metadata.user_ids"}
-                ]
-            },
-            name=self.vector_index_name,
-            type="vectorSearch",
-        )
-        
-        full_text_model = SearchIndexModel(
-            definition={"mappings": {"dynamic": True, "fields": {"text": {"type": "string"}}}},
-            name=self.search_index_name,
-            type="search",
-        )
-        
-        index_names = [self.vector_index_name, self.search_index_name]
-        models = [vector_search_model, full_text_model]
 
-        for index_name,model in zip(index_names,models):
-            try:
-                logging.info(f"Ensuring file index '{index_name}' exists...")
-                self.file_collection.create_search_index(model=model)
-            except pymongo.errors.OperationFailure as e:
-                if "already exists" in str(e).lower():
-                    logging.warning(f"Index '{index_name}' already exists. Skipping creation.")
-                else:
-                    raise e
-
+    # --- REFACTORED: Now accepts the path_to_id_map directly ---
     def _load_and_prepare_docs(
             self,
-            file_id_map: Dict[str, str],
+            path_to_id_map: Dict[str, str],
             owner_user_id: str,
             agent_id: Optional[str],
             thread_id: Optional[str],
             user_ids: Optional[list]
         ) -> List[Document]:
         """
-        Loads one or more documents and enriches them with the provided metadata.
+        Loads unique documents efficiently and enriches them with metadata.
         """
-        all_docs = []
-        # Loop through each file to load it and assign its unique metadata
-        for file_id, file_path in file_id_map.items():
-            try:
-                reader = SimpleDirectoryReader(input_files=[file_path])
-                docs = reader.load_data()
-                logging.info(f"Loaded {len(docs)} document object(s) from '{os.path.basename(file_path)}'.")
+        all_unique_paths = list(path_to_id_map.keys())
+        try:
+            reader = SimpleDirectoryReader(input_files=all_unique_paths)
+            docs = reader.load_data()
+            logging.info(f"Loaded {len(docs)} document object(s) from {len(all_unique_paths)} unique file(s).")
 
-                for doc in docs:
-                    doc.metadata["file_id"] = file_id
-                    doc.metadata["file_name"] = os.path.basename(file_path)
-                    doc.metadata["owner_user_id"] = owner_user_id
-                    doc.metadata["user_ids"] = user_ids
-                    if agent_id:
-                        doc.metadata["agent_id"] = agent_id
-                    elif thread_id:
-                        doc.metadata["thread_id"] = thread_id
-                    doc.metadata["created_at"] = datetime.now(timezone.utc)
-                all_docs.extend(docs)
-            except Exception as e:
-                logging.error(f"Failed to load or prepare file {file_path}: {e}")
-        
-        logging.info(f"Successfully prepared a total of {len(all_docs)} document objects.")
-        return all_docs
+            for doc in docs:
+                file_path = doc.metadata.get("file_path")
+                file_id = path_to_id_map.get(file_path)
+                
+                doc.metadata["file_id"] = file_id
+                doc.metadata["file_name"] = os.path.basename(file_path)
+                doc.metadata["owner_user_id"] = owner_user_id
+                doc.metadata["user_ids"] = user_ids or []
+                if agent_id:
+                    doc.metadata["agent_id"] = agent_id
+                elif thread_id:
+                    doc.metadata["thread_id"] = thread_id
+                doc.metadata["created_at"] = datetime.now(timezone.utc)
+        except Exception as e:
+            logging.exception(f"Failed to load or prepare files. Error: {e}")
+            return []
+            
+        logging.info(f"Successfully prepared a total of {len(docs)} document objects.")
+        return docs
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    def _insert_batch_with_retry(self, index: VectorStoreIndex, batch_nodes: List):
+        index.insert_nodes(batch_nodes)
 
     def ingest_files(
             self,
             file_paths: List[str],
             owner_user_id: str,
-            agent_id: Optional[str] = None,
-            thread_id: Optional[str] = None,
-            user_ids: Optional[list] = []
+            agent_id: Optional[str],
+            thread_id: Optional[str],
+            user_ids: Optional[list]
         ):
         """
-        Creates and uploads a new vectorized file on a specific MongoDB database and collection.
+        Deduplicates file paths, then creates and uploads vectorized files to MongoDB.
         """
-        if not agent_id and not thread_id:
-            logging.error("INGESTION FAILED: You must provide either an 'agent_id' or a 'thread_id'.")
-            return
-        
-        final_user_ids = []
-        if user_ids:
-            final_user_ids = list(set(user_ids + [owner_user_id]))
+        # Ensure owner_user_id is included in the user_ids list IF this is not empty
+        final_user_ids = list(dict.fromkeys([*user_ids, owner_user_id])) if user_ids else []
 
-        logging.info(f"--- Starting batch ingestion for MongoDB collection '{self.db_name}.{self.file_collection_name}' ---")
+        unique_file_paths = list(dict.fromkeys(file_paths))
+        if len(unique_file_paths) < len(file_paths):
+            logging.info(f"Removed {len(file_paths) - len(unique_file_paths)} duplicate file paths.")
         
+        logging.info(f"--- Starting batch ingestion for {len(unique_file_paths)} unique file(s) ---")
         try:
-            file_id_map = {self._generate_file_id(): path for path in file_paths}
-            logging.info(f"Generated unique IDs for {len(file_id_map)} files.")
+            path_to_id_map = {path: self._generate_file_id() for path in unique_file_paths}
+
+            docs = self._load_and_prepare_docs(path_to_id_map, owner_user_id, agent_id, thread_id, final_user_ids)
+            if not docs:
+                logging.warning("No documents were prepared. Aborting ingestion.")
+                return
+
+            nodes = self.text_splitter.get_nodes_from_documents(docs, show_progress=False)
+            if not nodes:
+                logging.warning("No nodes were produced from documents. Aborting ingestion.")
+                return
+            
+            logging.info(f"Documents split into {len(nodes)} text chunks (nodes).")
 
             vector_store = MongoDBAtlasVectorSearch(
                 mongodb_client=self.mongo_client,
@@ -160,55 +121,32 @@ class FileManagementService:
                 collection_name=self.file_collection_name,
             )
             storage_context = StorageContext.from_defaults(vector_store=vector_store)
+            index = VectorStoreIndex(nodes=[], storage_context=storage_context, embed_model=self.embed_model)
 
-            documents = self._load_and_prepare_docs(file_id_map, owner_user_id, agent_id, thread_id, final_user_ids)
-            if not documents:
-                logging.warning("No documents were loaded. Aborting ingestion.")
-                return
-
-            nodes = self.text_splitter.get_nodes_from_documents(documents, show_progress=True)
-            logging.info(f"Split documents into {len(nodes)} text chunks (nodes).")
-
-            # Ingest the data in memory-safe batches.
-            for i in range(0, len(nodes), self.settings.llm.ingestion_batch_size):
-                batch_nodes = nodes[i:i + self.settings.llm.ingestion_batch_size]
-                batch_num = (i // self.settings.llm.ingestion_batch_size) + 1
-                total_batches = (len(nodes) + self.settings.llm.ingestion_batch_size - 1) // self.settings.llm.ingestion_batch_size
+            total_batches = (len(nodes) + self.batch_size - 1) // self.batch_size
+            for i in range(0, len(nodes), self.batch_size):
+                batch_nodes = nodes[i:i + self.batch_size]
+                batch_num = (i // self.batch_size) + 1
                 
                 logging.info(f"--- Processing Batch {batch_num}/{total_batches} ---")
-                
-                VectorStoreIndex(
-                    nodes=batch_nodes,
-                    storage_context=storage_context,
-                    embed_model=self.embed_model,
-                    show_progress=True
-                )
+                self._insert_batch_with_retry(index, batch_nodes)
             
-            # Now that the collection exists and has data, ensure the search indexes are created on it.
-            self._ensure_atlas_indexes()
-            
-            logging.info(f"--- Successfully processed and indexed all batches for collection '{self.db_name}.{self.file_collection_name}' ---")
+            logging.info(f"--- Successfully processed and indexed all batches ---")
         
         except Exception:
             logging.exception("An unexpected error occurred during the ingestion run.")
     
 
-    def list_files_for_agent(self, agent_id: str, user_id: str, agent_owner_id: str) -> List[Dict]:
+    def list_files_for_agent(self, agent_id: str, user_id: str) -> List[Dict]:
         """
         Lists all unique files for a given agent that are accessible by the user.
         - If the user is the agent owner, they see all files.
         - If the user is not the owner, they see only public files or files they have explicit access to.
         """
-        match_clauses = [{"metadata.agent_id": agent_id}]
-
-        if user_id != agent_owner_id:
-            permission_filter = {
-                "$or": [
-                    {"metadata.user_ids": user_id},
-                    {"metadata.user_ids": {"$exists": False}}
-                ]
-            }
-            match_clauses.append(permission_filter)
+        match_clauses = [
+            {"metadata.agent_id": agent_id},
+            {"$or": [{"metadata.user_ids": user_id},{"metadata.user_ids": {"$exists": False}}]}
+        ]
 
         pipeline = [
             {"$match": {"$and": match_clauses}},
@@ -232,14 +170,11 @@ class FileManagementService:
         Lists all unique files associated with a specific user, either as an owner 
         or as an authorized user, using an aggregation pipeline.
         """
+        match_clause = {
+            "$or": [{"metadata.user_ids": user_id},{"metadata.user_ids": {"$exists": False}}]
+        }
         pipeline = [
-            {"$match": {
-                "$or": [
-                    {"metadata.user_ids": user_id},
-                    {"metadata.user_ids": {"$exists": False}}
-                    ]
-                }
-            },
+            {"$match": match_clause},
             {"$group": {
                 "_id": "$metadata.file_id",
                 "file_name": {"$first": "$metadata.file_name"}
@@ -298,74 +233,29 @@ class FileManagementService:
     def delete_file_by_id(self, file_id: str) -> int:
         """
         Deletes all nodes associated with a specific file_id for a given agent.
-        Returns the number of deleted nodes.
         """
-        if not file_id:
-            raise ValueError("file_id must be provided.")
-
         logging.info(f"Attempting to delete all nodes for file_id '{file_id}'")
         try:
             result = self.file_collection.delete_many({"metadata.file_id": file_id})
             logging.info(f"Successfully deleted {result.deleted_count} nodes for file_id '{file_id}'.")
-            return True
+            return result.deleted_count
         except Exception:
             logging.exception(f"An error occurred during file deletion for file_id '{file_id}'.")
             return False
     
-    def has_access_to_file(self, file_id: str, user_id: str) -> bool:
+    def delete_files_by_metadata(self, metadata_filter: Dict[str, Any]) -> int:
         """
-        Checks if a user has access to the agent, either by being the owner
-        or by being in the agent's user_ids list.
+        Deletes all nodes (document chunks) from the file collection based on a metadata filter.
         """
-        file = self.file_collection.find_one({"_id": file_id})
-        if not file:
+        if not metadata_filter:
+            logging.warning("delete_files_by_metadata called with an empty filter. Aborting to prevent accidental mass deletion.")
             return False
-        if file.get("owner_user_id") == user_id:
+        logging.info(f"Attempting to delete file nodes with filter: {metadata_filter}")
+        try:
+            result = self.file_collection.delete_many(metadata_filter)
+            logging.info(f"Successfully deleted {result.deleted_count} file nodes.")
             return True
-        if user_id in file.get("user_ids", []):
-            return True
-        return False
-
-    def is_owner_of_file(self, file_id: str, owner_user_id: str) -> bool:
-        """Checks if a user is the owner of the agent that a file belongs to."""
-        file = self.file_collection.find_one({"_id": file_id})
-        if not file:
+        except Exception as e:
+            logging.exception(f"An error occurred during metadata deletion: {e}")
             return False
-        if file.get("owner_user_id") == owner_user_id:
-            return True
-        return False
-    
-    def calculate_file_permissions(
-            self,
-            agent_user_ids: List[str],
-            file_user_ids: Optional[List[str]],
-            owner_user_id: str
-        ) -> Dict[str, List[str]]:
         
-        #Calculates the final user access list for a file based on hierarchical permissions.
-        
-        # --- Rule 1: File inherits permissions from the agent ---
-        if file_user_ids is None or file_user_ids==[]:
-            return {"applied_user_ids": agent_user_ids, "excluded_user_ids": []}
-
-        # --- Rule 2: File has specific permissions ---
-        agent_permissions = set(agent_user_ids)
-        file_request_permissions = set(file_user_ids)
-
-        # If the agent is public (empty list), all requested users are applied.
-        if not agent_permissions:
-            applied_ids = file_request_permissions
-            excluded_ids = set()
-        else:
-            # If the agent is restricted, find the intersection.
-            applied_ids = agent_permissions.intersection(file_request_permissions)
-            excluded_ids = file_request_permissions.difference(agent_permissions)
-        
-        # Ensure the owner has access.
-        applied_ids.add(owner_user_id)
-
-        return {
-            "applied_user_ids": list(applied_ids),
-            "excluded_user_ids": list(excluded_ids)
-        }
-    

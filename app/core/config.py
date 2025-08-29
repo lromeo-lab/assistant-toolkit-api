@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     """Main application settings, composed of nested configuration models."""
     project_name: str = "Agent Toolkit API"
     api_v1_str: str = "/api/v1"
-    memory_management_root_endpoint: str
+    internal_worker_url: str
 
     database: DataBaseSettings
     llm: LlmSettings
